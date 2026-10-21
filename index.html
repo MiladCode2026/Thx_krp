@@ -87,17 +87,19 @@ const GROUPS = {
   shape: ["Shape", [
     ["N_EDGES", "Edges (n)", 0, "0 = circle, 3 = triangle, 4 = square, 5 = pentagon, …"],
     ["DIAMETER", "Shape diameter", 0.8, "Fraction of the frame width (or of the height, if that is smaller). A polygon fits inside a circle of this diameter"],
-    ["ROTATION", "Rotation (°)", 0, "Turns a polygon counter-clockwise. 0 = flat bottom"],
+    ["ROTATION", "Rotation (°)", 0, "Turns a polygon counter-clockwise at the start. 0 = flat bottom"],
+    ["SPIN", "Spin (°/s)", 0, "Spins a polygon. Positive = counter-clockwise, negative = clockwise, 0 = fixed shape. A moving wall changes the bounce direction as a real moving wall would, but every ball keeps its speed. No effect on a circle"],
     ["OUTLINE", "Outline width", 3, "Pixels for a 1080-pixel video; 0 hides the outline"],
     ["OUTLINE_COLOR", "Outline color", "#ffffff", "Any color"],
   ]],
   balls: ["Balls", [
     ["START_ANGLE", "Start angle (°)", 37, "Direction of the first ball. 0 = right, 90 = up, counter-clockwise"],
-    ["SPEED", "Speed", 0.6, "Shape diameters per second. Every ball keeps this speed"],
+    ["SPEED", "Speed", 0.6, "Shape diameters per second. Every ball keeps this speed, also after bouncing off a spinning wall"],
     ["BALL_SIZE", "Ball diameter", 0.02, "Fraction of the shape diameter; 0.005–0.1"],
-    ["SPLIT_ANGLE", "Split angle (°)", 8, "At a bounce the ball becomes two. They leave this many degrees to either side of the mirror direction; 1–30. 0 makes them overlap"],
+    ["SPLIT_ANGLE", "Split angle (°)", 8, "At a bounce the ball becomes two. They leave this many degrees to either side of the bounce direction; 1–30. 0 makes them overlap"],
     ["MAX_BALLS", "Balls (M)", 10000, "Splitting stops when this many balls exist; up to about 20000"],
-    ["COLORS", "Colors", "hsv", "A colormap or a color. A colormap is spread over log(n), where n is the number of balls, so early splits get distinct colors. Several colors (separated by spaces) repeat in order of birth. One color = all balls the same. Maps: hsv, pastel, rainbow, cool, spring, summer, autumn, winter. A new ball gets a new color; old balls keep theirs"],
+    ["COLORS", "Colors", "hsv", "A colormap or a color. A colormap is spread over the balls in order of birth, shaped by Color curve. Several colors (separated by spaces) repeat in order of birth. One color = all balls the same. Maps: hsv, pastel, rainbow, cool, spring, summer, autumn, winter. A new ball gets a new color; old balls keep theirs"],
+    ["COLOR_CURVE", "Color curve", 0.35, "How the colormap spreads over the balls. 1 = equal balls per color. Lower = new colors appear faster at the start. Try 0.2–0.6"],
   ]],
   video: ["Video", [
     ["WIDTH", "Width (px)", 1080, "Vertical phone 1080; landscape 1920. Even number"],
@@ -115,12 +117,12 @@ const GROUPS = {
     ["LABEL_POS", "Label height", 0.97, "Height of the label's top edge from the bottom; 0.9 = 90%"],
   ]],
   sound: ["Sound", [
-    ["CLICK", "Click volume", 0.5, "A tick for each new ball. Pitch rises as balls multiply. Saved in the video. 0 = silent; up to 1"],
+    ["CLICK", "Click volume", 0.5, "A tick for each new ball. Pitch rises and volume falls as balls multiply. Saved in the video. 0 = silent; up to 1"],
   ]],
 };
 const ALL = Object.values(GROUPS).flatMap(g => g[1]);
 const INT_KEYS = new Set(["N_EDGES", "WIDTH", "HEIGHT", "FPS", "MAX_BALLS"]);
-const SIGNED = new Set(["START_ANGLE", "ROTATION"]);
+const SIGNED = new Set(["START_ANGLE", "ROTATION", "SPIN"]);
 const LIST_KEYS = new Set(["COLORS"]);
 const STORE = "splitting-balls-settings";
 const MUXER_URL = "https://cdn.jsdelivr.net/npm/mp4-muxer@5/+esm";
@@ -172,17 +174,19 @@ function readSettings() {
   if (S.WIDTH % 2 || S.HEIGHT % 2 || Math.min(S.WIDTH, S.HEIGHT) < 64) throw new Error("Width and height must be even numbers of at least 64.");
   if (S.FPS < 1) throw new Error("Frames per second must be at least 1.");
   if (S.CLICK > 1) throw new Error("Click volume must be 1 or less.");
+  if (S.COLOR_CURVE <= 0) throw new Error("Color curve must be above 0.");
   return S;
 }
 
 // ======================= Simulation =======================
 // Units: the shape's circumscribed circle has diameter 1, centered at the origin.
+// Time: frame f shows the state at time f / FPS. A spinning polygon turns by SPIN degrees per second.
 class Sim {
   constructor(S) {
     this.S = S; this.M = S.MAX_BALLS; this.n = S.N_EDGES;
-    this.R = 0.5; this.r = S.BALL_SIZE / 2; this.dt = 1 / S.FPS;
+    this.R = 0.5; this.r = S.BALL_SIZE / 2; this.dt = 1 / S.FPS; this.speed = S.SPEED;
     this.cs = Math.cos(S.SPLIT_ANGLE * Math.PI / 180); this.sn = Math.sin(S.SPLIT_ANGLE * Math.PI / 180);
-    this.normals = [];                                   // polygon: outward edge normals
+    this.normals = [];                                   // polygon: outward edge normals at time 0
     if (this.n >= 3) {
       for (let k = 0; k < this.n; k++) {
         const a = (-90 + S.ROTATION + 360 * k / this.n) * Math.PI / 180;
@@ -191,6 +195,12 @@ class Sim {
       this.apo = this.R * Math.cos(Math.PI / this.n) - this.r;   // ball centers stay inside this
     } else this.apo = this.R - this.r;
     if (this.apo <= 0) throw new Error("The balls are too large for this shape.");
+    this.spin = this.n >= 3 ? S.SPIN * Math.PI / 180 : 0;        // radians per second; a circle ignores spin
+    if (this.spin) {
+      this.base = this.normals.map(q => q[2]);
+      for (const key of ["fx", "fy", "ex", "ey", "tx", "ty"]) this[key] = new Float64Array(this.n);
+      this.frameT = -1;                                           // normals at the start (f) and end (e) of the frame; t = temporary
+    }
     const list = S.COLORS;
     if (list.length === 1 && isMap(list[0])) {
       const K = 256, map = COLORMAPS[list[0]];
@@ -209,20 +219,24 @@ class Sim {
     this.reached = this.balls.length >= this.M ? 0 : -1;
   }
 
-  colorIndex(k) {   // k = birth order; n = ball count including the new ball
+  colorIndex(k) {   // k = birth order, 0-based
     if (!this.mapped) return k % this.pal.length;
-    const n = k + 1;
-    const x = this.M > 1 ? Math.log(n) / Math.log(this.M) : 0;   // 0 at n=1, 1 at n=M
+    const x = this.M > 1 ? Math.pow(k / (this.M - 1), this.S.COLOR_CURVE) : 0;   // 0 for the first ball, 1 for the last
     return Math.min(this.pal.length - 1, Math.floor(x * this.pal.length));
   }
 
   add(x, y, vx, vy) {
-    const b = { x, y, vx, vy, rem: -1, c: this.colorIndex(this.balls.length) };
+    const b = { x, y, vx, vy, rem: -1, T: 0, c: this.colorIndex(this.balls.length) };
     this.balls.push(b); this.groups[b.c].push(b);
     return b;
   }
 
-  wall(b) {   // time until the ball center reaches the wall; sets this.nx, this.ny to the wall normal
+  setNormals(T, cx, cy) {   // wall normals of the spinning polygon at time T
+    const w = this.spin * T;
+    for (let k = 0; k < this.n; k++) { const a = this.base[k] + w; cx[k] = Math.cos(a); cy[k] = Math.sin(a); }
+  }
+
+  wall(b) {   // fixed shape: time until the ball center reaches the wall; sets this.nx, this.ny to the wall normal
     if (this.n < 3) {
       const a = b.vx * b.vx + b.vy * b.vy, p = b.x * b.vx + b.y * b.vy, c = b.x * b.x + b.y * b.y - this.apo * this.apo;
       const t = Math.max(0, (-p + Math.sqrt(Math.max(0, p * p - a * c))) / a);
@@ -240,35 +254,97 @@ class Sim {
     return t;
   }
 
-  turn(rx, ry, sgn, nx, ny) {   // rotate the mirror direction; keep it pointing into the shape
+  // Spinning polygon: time until the ball center meets a moving wall, within tmax. T = time now.
+  // Sets this.nx, this.ny (wall normal at the hit) and this.un (speed of the wall along that normal).
+  wallSpin(b, T, tmax) {
+    const apo = this.apo, r0 = apo - this.speed * tmax;
+    if (r0 > 0 && b.x * b.x + b.y * b.y < r0 * r0) return Infinity;   // too far from every wall to reach one
+    let cx = this.fx, cy = this.fy;
+    if (T !== this.frameT) { this.setNormals(T, this.tx, this.ty); cx = this.tx; cy = this.ty; }
+    const w = this.spin, ce = Math.cos(w * tmax), se = Math.sin(w * tmax);
+    const xe = b.x + b.vx * tmax, ye = b.y + b.vy * tmax;
+    let best = Infinity, bk = -1;
+    for (let k = 0; k < this.n; k++) {
+      const c = cx[k], s = cy[k];
+      const f0 = c * b.x + s * b.y - apo;                           // > 0 means outside this wall
+      let tau;
+      if (f0 >= -1e-9) {                                            // touching: hit only if the wall and ball approach
+        const f1 = w * (c * b.y - s * b.x) + c * b.vx + s * b.vy;   // approach speed of the ball toward the wall
+        if (f1 <= 0) continue;
+        tau = 0;
+      } else {
+        const fe = (c * ce - s * se) * xe + (s * ce + c * se) * ye - apo;
+        if (fe < 0) continue;                                       // still inside at the end of the step
+        let lo = 0, hi = tmax, flo = f0, fhi = fe, m = tmax;        // find the crossing between 0 and tmax
+        for (let i = 0; i < 12; i++) {
+          m = lo - flo * (hi - lo) / (fhi - flo);
+          const cm = Math.cos(w * m), sm = Math.sin(w * m);
+          const fm = (c * cm - s * sm) * (b.x + b.vx * m) + (s * cm + c * sm) * (b.y + b.vy * m) - apo;
+          if (Math.abs(fm) < 1e-12) break;
+          if (fm < 0) { lo = m; flo = fm; } else { hi = m; fhi = fm; }
+        }
+        tau = m;
+      }
+      if (tau < best) { best = tau; bk = k; }
+    }
+    if (bk < 0) return Infinity;
+    const cm = Math.cos(w * best), sm = Math.sin(w * best), c = cx[bk], s = cy[bk];
+    const nx = c * cm - s * sm, ny = s * cm + c * sm;
+    const px = b.x + b.vx * best, py = b.y + b.vy * best;
+    this.nx = nx; this.ny = ny;
+    this.un = w * (px * ny - py * nx);                              // wall velocity (spin × position) along the normal
+    return best;
+  }
+
+  // Rotate the bounce direction by the split angle. If the result still points into the (moving) wall,
+  // mirror it away from the wall. Then restore the set speed when the shape spins.
+  turn(rx, ry, sgn, nx, ny, un) {
     const s = sgn * this.sn;
     let x = rx * this.cs - ry * s, y = rx * s + ry * this.cs;
-    const d = x * nx + y * ny;
+    const d = x * nx + y * ny - un;
     if (d > 0) { x -= 2 * d * nx; y -= 2 * d * ny; }
+    if (this.spin) { const k = this.speed / Math.hypot(x, y); x *= k; y *= k; }
     return [x, y];
   }
 
-  move(b, t) {
+  move(b, t, T) {   // T = time at the start of this movement
     for (let g = 0; g < 64 && t > 1e-12; g++) {
-      const h = this.wall(b);
+      const h = this.spin ? this.wallSpin(b, T, t) : this.wall(b);
       if (h > t) { b.x += b.vx * t; b.y += b.vy * t; return; }
-      b.x += b.vx * h; b.y += b.vy * h; t -= h; this.bounces++;
-      const nx = this.nx, ny = this.ny, d = b.vx * nx + b.vy * ny;
-      const rx = b.vx - 2 * d * nx, ry = b.vy - 2 * d * ny;   // mirror direction
+      b.x += b.vx * h; b.y += b.vy * h; t -= h; T += h; this.bounces++;
+      const nx = this.nx, ny = this.ny, un = this.spin ? this.un : 0;
+      const d = b.vx * nx + b.vy * ny - un;                    // approach speed relative to the wall
+      let rx = b.vx - 2 * d * nx, ry = b.vy - 2 * d * ny;      // bounce direction (mirror in the wall's frame)
+      if (this.spin) { const k = this.speed / Math.hypot(rx, ry); rx *= k; ry *= k; }
       if (this.balls.length < this.M) {
-        const c = this.turn(rx, ry, -1, nx, ny), p = this.turn(rx, ry, 1, nx, ny);
+        const c = this.turn(rx, ry, -1, nx, ny, un), p = this.turn(rx, ry, 1, nx, ny, un);
         const kid = this.add(b.x, b.y, c[0], c[1]);
-        kid.rem = t;                                           // the child moves on for the rest of this frame
+        kid.rem = t; kid.T = T;                                // the child moves on for the rest of this frame
         b.vx = p[0]; b.vy = p[1];
       } else { b.vx = rx; b.vy = ry; }
     }
   }
 
+  clamp(b) {   // safety: push a ball back inside if a wall has caught it
+    if (b.x * b.x + b.y * b.y <= this.apo * this.apo) return;
+    for (let k = 0; k < this.n; k++) {
+      const o = this.ex[k] * b.x + this.ey[k] * b.y - this.apo;
+      if (o > 0) { b.x -= o * this.ex[k]; b.y -= o * this.ey[k]; }
+    }
+  }
+
   advance() {
-    const B = this.balls;
+    const B = this.balls, T0 = this.frame * this.dt;
+    if (this.spin) {
+      this.frameT = T0;
+      this.setNormals(T0, this.fx, this.fy);
+      this.setNormals(T0 + this.dt, this.ex, this.ey);
+    }
     for (let i = 0; i < B.length; i++) {                       // children are appended and visited in the same pass
-      const b = B[i], t = b.rem >= 0 ? b.rem : this.dt;
-      b.rem = -1; this.move(b, t);
+      const b = B[i];
+      const t = b.rem >= 0 ? b.rem : this.dt, T = b.rem >= 0 ? b.T : T0;
+      b.rem = -1; this.move(b, t, T);
+      if (this.spin) this.clamp(b);
     }
     this.frame++;
     if (this.reached < 0 && B.length >= this.M) this.reached = this.frame;
@@ -283,13 +359,14 @@ class Sim {
   draw(ctx, W, H) {
     const S = this.S, px = Math.min(W, H) / 1080, D = S.DIAMETER * Math.min(W, H);
     const X = x => W / 2 + x * D, Y = y => H / 2 - y * D;
+    const rot = this.spin * this.frame * this.dt;              // how far the polygon has turned
     ctx.globalAlpha = 1; ctx.fillStyle = S.BG; ctx.fillRect(0, 0, W, H);
     if (S.OUTLINE > 0) {
       ctx.strokeStyle = S.OUTLINE_COLOR; ctx.lineWidth = S.OUTLINE * px; ctx.lineJoin = "round";
       ctx.beginPath();
       if (this.n < 3) ctx.arc(W / 2, H / 2, this.R * D, 0, 2 * Math.PI);
       else this.normals.forEach(([, , a], k) => {
-        const v = a + Math.PI / this.n, x = X(this.R * Math.cos(v)), y = Y(this.R * Math.sin(v));
+        const v = a + rot + Math.PI / this.n, x = X(this.R * Math.cos(v)), y = Y(this.R * Math.sin(v));
         if (k) ctx.lineTo(x, y); else ctx.moveTo(x, y);
       });
       ctx.closePath(); ctx.stroke();
@@ -325,8 +402,9 @@ function renderClicks(S, counts) {   // one tick per frame that has new balls
   for (let f = 1; f < counts.length; f++) {
     const births = counts[f] - counts[f - 1];
     if (births <= 0) continue;
-    const freq = 400 * 2 ** (3 * Math.min(1, Math.log(counts[f]) / lm));   // 400 Hz up to 3200 Hz
-    const amp = 0.5 * S.CLICK * Math.min(1, 0.4 + 0.1 * Math.log2(births));
+    const prog = Math.min(1, Math.log(counts[f]) / lm);   // 0 at the start, 1 at M balls
+    const freq = 400 * 2 ** (3 * prog);                   // 400 Hz up to 3200 Hz
+    const amp = 0.5 * S.CLICK * Math.min(1, 0.4 + 0.1 * Math.log2(births)) * (1 - 0.6 * prog);
     const start = Math.round(f / S.FPS * SR);
     for (let i = 0; i < len && start + i < out.length; i++)
       out[start + i] += amp * Math.sin(2 * Math.PI * freq * i / SR) * Math.exp(-5 * i / len);
