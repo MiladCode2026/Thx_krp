@@ -97,7 +97,7 @@ const GROUPS = {
     ["BALL_SIZE", "Ball diameter", 0.02, "Fraction of the shape diameter; 0.005–0.1"],
     ["SPLIT_ANGLE", "Split angle (°)", 8, "At a bounce the ball becomes two. They leave this many degrees to either side of the mirror direction; 1–30. 0 makes them overlap"],
     ["MAX_BALLS", "Balls (M)", 10000, "Splitting stops when this many balls exist; up to about 20000"],
-    ["COLORS", "Colors", "hsv", "A colormap or a color. A colormap spreads over the balls in order of birth. Several colors (separated by spaces) repeat. One color = all balls the same. Maps: hsv, pastel, rainbow, cool, spring, summer, autumn, winter. A new ball gets a new color; old balls keep theirs"],
+    ["COLORS", "Colors", "hsv", "A colormap or a color. A colormap is spread over log(n), where n is the number of balls, so early splits get distinct colors. Several colors (separated by spaces) repeat in order of birth. One color = all balls the same. Maps: hsv, pastel, rainbow, cool, spring, summer, autumn, winter. A new ball gets a new color; old balls keep theirs"],
   ]],
   video: ["Video", [
     ["WIDTH", "Width (px)", 1080, "Vertical phone 1080; landscape 1920. Even number"],
@@ -107,12 +107,15 @@ const GROUPS = {
     ["BITRATE", "Bitrate (Mbit/s)", 8, "Quality and file size; 4–12"],
   ]],
   timing: ["Timing", [
-    ["HOLD_SEC", "Final hold", 3, "Seconds to show the picture after M balls exist; 2–5"],
+    ["HOLD_SEC", "Final hold", 3, "Seconds the balls keep moving after M balls exist, with no more splitting. 0 ends the video at once. Limited by Longest video"],
     ["MAX_SEC", "Longest video", 60, "The video stops here even if M is not reached"],
   ]],
   label: ["Label", [
     ["LABEL", "Label size", 40, "Size of the 'balls = …' text in pixels for a 1080-pixel video; 0 hides it"],
     ["LABEL_POS", "Label height", 0.97, "Height of the label's top edge from the bottom; 0.9 = 90%"],
+  ]],
+  sound: ["Sound", [
+    ["CLICK", "Click volume", 0.5, "A tick for each new ball. Pitch rises as balls multiply. Saved in the video. 0 = silent; up to 1"],
   ]],
 };
 const ALL = Object.values(GROUPS).flatMap(g => g[1]);
@@ -168,6 +171,7 @@ function readSettings() {
   if (S.MAX_SEC <= 0) throw new Error("Longest video must be above 0.");
   if (S.WIDTH % 2 || S.HEIGHT % 2 || Math.min(S.WIDTH, S.HEIGHT) < 64) throw new Error("Width and height must be even numbers of at least 64.");
   if (S.FPS < 1) throw new Error("Frames per second must be at least 1.");
+  if (S.CLICK > 1) throw new Error("Click volume must be 1 or less.");
   return S;
 }
 
@@ -189,7 +193,7 @@ class Sim {
     if (this.apo <= 0) throw new Error("The balls are too large for this shape.");
     const list = S.COLORS;
     if (list.length === 1 && isMap(list[0])) {
-      const K = Math.min(256, this.M), map = COLORMAPS[list[0]];
+      const K = 256, map = COLORMAPS[list[0]];
       this.pal = Array.from({ length: K }, (_, q) => map(q / K)); this.mapped = true;
     } else { this.pal = list; this.mapped = false; }
     this.maxFrames = Math.round(S.MAX_SEC * S.FPS);
@@ -205,8 +209,11 @@ class Sim {
     this.reached = this.balls.length >= this.M ? 0 : -1;
   }
 
-  colorIndex(k) {   // k = birth order; a ball keeps its color for life
-    return this.mapped ? Math.min(this.pal.length - 1, Math.floor(k * this.pal.length / this.M)) : k % this.pal.length;
+  colorIndex(k) {   // k = birth order; n = ball count including the new ball
+    if (!this.mapped) return k % this.pal.length;
+    const n = k + 1;
+    const x = this.M > 1 ? Math.log(n) / Math.log(this.M) : 0;   // 0 at n=1, 1 at n=M
+    return Math.min(this.pal.length - 1, Math.floor(x * this.pal.length));
   }
 
   add(x, y, vx, vy) {
@@ -303,10 +310,35 @@ class Sim {
   }
 }
 
-function measure(S) {   // run once to learn the video length
-  const p = new Sim(S);
-  while (!p.done()) p.advance();
-  return { total: p.frame + 1, reached: p.reached, balls: p.balls.length, sim: p };
+function measure(S) {   // run once to learn the video length and the ball count of each frame
+  const p = new Sim(S), counts = [];
+  while (!p.done()) { counts.push(p.balls.length); p.advance(); }
+  counts.push(p.balls.length);
+  return { total: p.frame + 1, reached: p.reached, balls: p.balls.length, sim: p, counts };
+}
+
+// ======================= Sound =======================
+const SR = 44100;
+function renderClicks(S, counts) {   // one tick per frame that has new balls
+  const out = new Float32Array(Math.ceil(counts.length / S.FPS * SR));
+  const len = Math.round(0.02 * SR), lm = Math.log(Math.max(2, S.MAX_BALLS));
+  for (let f = 1; f < counts.length; f++) {
+    const births = counts[f] - counts[f - 1];
+    if (births <= 0) continue;
+    const freq = 400 * 2 ** (3 * Math.min(1, Math.log(counts[f]) / lm));   // 400 Hz up to 3200 Hz
+    const amp = 0.5 * S.CLICK * Math.min(1, 0.4 + 0.1 * Math.log2(births));
+    const start = Math.round(f / S.FPS * SR);
+    for (let i = 0; i < len && start + i < out.length; i++)
+      out[start + i] += amp * Math.sin(2 * Math.PI * freq * i / SR) * Math.exp(-5 * i / len);
+  }
+  for (let i = 0; i < out.length; i++) out[i] = Math.max(-1, Math.min(1, out[i]));
+  return out;
+}
+
+async function pickAudioConfig() {
+  if (!("AudioEncoder" in window)) return null;
+  const config = { codec: "mp4a.40.2", sampleRate: SR, numberOfChannels: 1, bitrate: 96000 };
+  try { const r = await AudioEncoder.isConfigSupported(config); return r.supported ? r.config : null; } catch { return null; }
 }
 
 // ======================= Screens =======================
@@ -359,8 +391,21 @@ function fmtTime(sec) { sec = Math.round(sec); return sec >= 60 ? `${Math.floor(
 
 // ======================= Preview =======================
 let preview = null, previewTotal = 0, playing = false, raf = 0, t0 = 0;
+let actx = null, asrc = null, abuf = null, lastF = 0;
 
-function toPreview() { if (collect()) go("preview"); }
+function startAudio(f) {
+  stopAudio();
+  if (!abuf || !actx) return;
+  asrc = actx.createBufferSource(); asrc.buffer = abuf; asrc.connect(actx.destination);
+  asrc.start(0, f / preview.S.FPS);
+}
+function stopAudio() { try { asrc?.stop(); } catch {} asrc = null; }
+
+function toPreview() {
+  if (!collect()) return;
+  actx ||= new (window.AudioContext || window.webkitAudioContext)();
+  actx.resume(); go("preview");
+}
 
 async function startPreview() {
   const S = collect(); if (!S) return history.back();
@@ -369,6 +414,10 @@ async function startPreview() {
   try {
     const m = measure(S);
     preview = m.sim; previewTotal = m.total;
+    if (S.CLICK > 0 && actx) {
+      const pcm = renderClicks(S, m.counts);
+      abuf = actx.createBuffer(1, pcm.length, SR); abuf.copyToChannel(pcm, 0);
+    } else abuf = null;
     $("notes").textContent = m.reached >= 0
       ? `${S.MAX_BALLS} balls after ${(m.reached / S.FPS).toFixed(1)} s. Video length: ${fmtTime(m.total / S.FPS)}.`
       : `Only ${m.balls} balls after ${S.MAX_SEC} s, so M is not reached. Raise Speed or Longest video.`;
@@ -378,6 +427,7 @@ async function startPreview() {
   $("scrub").max = previewTotal - 1; $("scrub").value = 0;
   $("previewNote").textContent = "Plays in real time. The saved video has every frame, even if this preview stutters.";
   playing = true; $("playBtn").textContent = "Pause"; t0 = performance.now();
+  lastF = 0; startAudio(0);
   raf = requestAnimationFrame(loop);
 }
 
@@ -386,6 +436,8 @@ function drawPreview(f) { const cv = $("view"); preview.seek(f); preview.draw(cv
 function loop(now) {
   if (!playing || !preview) return;
   const f = Math.floor((now - t0) / 1000 * preview.S.FPS) % previewTotal;
+  if (f < lastF) startAudio(f);   // the preview wrapped around
+  lastF = f;
   drawPreview(f); $("scrub").value = f;
   raf = requestAnimationFrame(loop);
 }
@@ -393,11 +445,13 @@ function loop(now) {
 function togglePlay() {
   if (!preview) return;
   if (playing) { stopPreview(); return; }
-  t0 = performance.now() - Number($("scrub").value) / preview.S.FPS * 1000;
+  const f = Number($("scrub").value);
+  t0 = performance.now() - f / preview.S.FPS * 1000;
+  lastF = f; startAudio(f);
   playing = true; $("playBtn").textContent = "Pause"; raf = requestAnimationFrame(loop);
 }
 
-function stopPreview() { playing = false; cancelAnimationFrame(raf); $("playBtn").textContent = "Play"; }
+function stopPreview() { playing = false; cancelAnimationFrame(raf); stopAudio(); $("playBtn").textContent = "Play"; }
 
 $("scrub").oninput = () => { if (!preview) return; stopPreview(); drawPreview(Number($("scrub").value)); };
 
@@ -428,7 +482,7 @@ async function runExport(S) {
   $("exportTitle").textContent = "Making video"; $("exportStatus").textContent = "Preparing…";
   $("exportBar").value = 0; $("exportInfo").textContent = ""; $("doneView").hidden = true;
   setExportButtons(false);
-  let lock = null, encoder = null;
+  let lock = null, encoder = null, aenc = null;
   try {
     if (!("VideoEncoder" in window)) throw new Error("This browser cannot make videos. Please use an up-to-date Chrome over https.");
     await sleep(30);
@@ -437,13 +491,30 @@ async function runExport(S) {
     try { mod = await import(MUXER_URL); } catch { throw new Error("Could not load the video tool. Check your internet connection."); }
     const { Muxer, ArrayBufferTarget } = mod;
     const config = await pickConfig(S);
+    const audioCfg = S.CLICK > 0 ? await pickAudioConfig() : null;
+    const pcm = audioCfg ? renderClicks(S, m.counts) : null;
     const W = S.WIDTH, H = S.HEIGHT, canvas = document.createElement("canvas");
     canvas.width = W; canvas.height = H;
     const ctx = canvas.getContext("2d", { alpha: false });
-    const muxer = new Muxer({ target: new ArrayBufferTarget(), video: { codec: "avc", width: W, height: H }, fastStart: "in-memory" });
-    let encError = null;
+    const opts = { target: new ArrayBufferTarget(), video: { codec: "avc", width: W, height: H }, fastStart: "in-memory" };
+    if (audioCfg) opts.audio = { codec: "aac", numberOfChannels: 1, sampleRate: SR };
+    const muxer = new Muxer(opts);
+    let encError = null, aPos = 0;
     encoder = new VideoEncoder({ output: (chunk, meta) => muxer.addVideoChunk(chunk, meta), error: e => { encError = e; } });
     encoder.configure(config);
+    if (audioCfg) {
+      aenc = new AudioEncoder({ output: (c, mt) => muxer.addAudioChunk(c, mt), error: e => { encError = e; } });
+      aenc.configure(audioCfg);
+    }
+    const feedAudio = upTo => {
+      upTo = Math.min(upTo, pcm.length);
+      while (aPos < upTo) {
+        const n = Math.min(4096, upTo - aPos);
+        const d = new AudioData({ format: "f32-planar", sampleRate: SR, numberOfFrames: n, numberOfChannels: 1,
+                                  timestamp: Math.round(aPos / SR * 1e6), data: pcm.subarray(aPos, aPos + n) });
+        aenc.encode(d); d.close(); aPos += n;
+      }
+    };
     try { lock = await navigator.wakeLock?.request("screen"); } catch {}
 
     const start = performance.now(), frameUs = 1e6 / S.FPS;
@@ -455,6 +526,7 @@ async function runExport(S) {
       encoder.encode(frame, { keyFrame: f % (S.FPS * 2) === 0 });
       frame.close();
       sim.advance();
+      if (aenc) feedAudio(Math.round((f + 1) * SR / S.FPS));
       while (encoder.encodeQueueSize > 4) await sleep(1);
       if (f % 3 === 0 || f === total - 1) {
         const done = f + 1, el = (performance.now() - start) / 1000;
@@ -464,7 +536,9 @@ async function runExport(S) {
         await sleep(0);
       }
     }
-    await encoder.flush(); muxer.finalize(); encoder.close(); encoder = null;
+    await encoder.flush();
+    if (aenc) { feedAudio(pcm.length); await aenc.flush(); aenc.close(); aenc = null; }
+    muxer.finalize(); encoder.close(); encoder = null;
 
     $("exportStatus").textContent = "Making pictures…";
     const stamp = new Date().toISOString().slice(0, 16).replace(/[-:]/g, "").replace("T", "-");
@@ -481,11 +555,12 @@ async function runExport(S) {
     $("exportTitle").textContent = "Done";
     $("exportStatus").textContent = `Video ready: ${fmtTime(total / S.FPS)} long, ${(video.size / 1e6).toFixed(1)} MB.`;
     $("exportInfo").textContent = (m.reached >= 0 ? "" : `M was not reached: ${m.balls} balls.\n`) +
+      (S.CLICK > 0 && !audioCfg ? "No sound: this phone cannot encode audio.\n" : "") +
       "Tap Save to keep it, Share to send it, or Pictures for the screenshots.";
     const dv = $("doneView"); dv.hidden = false;
     fitCanvas(dv, W, H, 0.45); sim.draw(dv.getContext("2d"), dv.width, dv.height);
   } catch (e) {
-    try { encoder?.close(); } catch {}
+    try { encoder?.close(); aenc?.close(); } catch {}
     $("exportTitle").textContent = e.message === "CANCELLED" ? "Cancelled" : "Something went wrong";
     $("exportStatus").textContent = e.message === "CANCELLED" ? "The video was not finished." : String(e.message || e);
   } finally {
