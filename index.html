@@ -97,6 +97,8 @@ const GROUPS = {
     ["SPEED", "Speed", 0.6, "Shape diameters per second. Every ball keeps this speed, also after bouncing off a spinning wall"],
     ["BALL_SIZE", "Ball diameter", 0.02, "Fraction of the shape diameter; 0.005–0.1"],
     ["SPLIT_ANGLE", "Split angle (°)", 8, "At a bounce the ball becomes two. They leave this many degrees to either side of the bounce direction; 1–30. 0 makes them overlap"],
+    ["SPLIT_GAP", "Split gap", 2, "After a split, a ball must travel this many ball diameters before it can split again. A bounce before that is a plain reflection. Stops piles of balls in corners and on edges. 0 = off"],
+    ["WALL_ANGLE", "Wall angle (°)", 5, "Smallest angle between a ball and the wall after a bounce. Stops balls from skimming along an edge. 0 = off; below 45"],
     ["MAX_BALLS", "Balls (M)", 10000, "Splitting stops when this many balls exist; up to about 20000"],
     ["COLORS", "Colors", "hsv", "A colormap or a color. A colormap is spread over the balls in order of birth, shaped by Color curve. Several colors (separated by spaces) repeat in order of birth. One color = all balls the same. Maps: hsv, pastel, rainbow, cool, spring, summer, autumn, winter. A new ball gets a new color; old balls keep theirs"],
     ["COLOR_CURVE", "Color curve", 0.35, "How the colormap spreads over the balls. 1 = equal balls per color. Lower = new colors appear faster at the start. Try 0.2–0.6"],
@@ -169,6 +171,7 @@ function readSettings() {
   if (S.SPEED <= 0) throw new Error("Speed must be above 0.");
   if (S.BALL_SIZE <= 0 || S.BALL_SIZE >= 0.5) throw new Error("Ball diameter must be above 0 and below 0.5.");
   if (S.SPLIT_ANGLE >= 90) throw new Error("Split angle must be below 90.");
+  if (S.WALL_ANGLE >= 45) throw new Error("Wall angle must be below 45.");
   if (S.MAX_BALLS < 1) throw new Error("Balls (M) must be at least 1.");
   if (S.MAX_SEC <= 0) throw new Error("Longest video must be above 0.");
   if (S.WIDTH % 2 || S.HEIGHT % 2 || Math.min(S.WIDTH, S.HEIGHT) < 64) throw new Error("Width and height must be even numbers of at least 64.");
@@ -186,6 +189,8 @@ class Sim {
     this.S = S; this.M = S.MAX_BALLS; this.n = S.N_EDGES;
     this.R = 0.5; this.r = S.BALL_SIZE / 2; this.dt = 1 / S.FPS; this.speed = S.SPEED;
     this.cs = Math.cos(S.SPLIT_ANGLE * Math.PI / 180); this.sn = Math.sin(S.SPLIT_ANGLE * Math.PI / 180);
+    this.smin = Math.sin(S.WALL_ANGLE * Math.PI / 180);           // smallest allowed sine of the exit angle
+    this.gap = S.SPLIT_GAP * S.BALL_SIZE / S.SPEED;               // seconds a ball must fly between two splits
     this.normals = [];                                   // polygon: outward edge normals at time 0
     if (this.n >= 3) {
       for (let k = 0; k < this.n; k++) {
@@ -226,7 +231,7 @@ class Sim {
   }
 
   add(x, y, vx, vy) {
-    const b = { x, y, vx, vy, rem: -1, T: 0, c: this.colorIndex(this.balls.length) };
+    const b = { x, y, vx, vy, rem: -1, T: 0, cool: 0, c: this.colorIndex(this.balls.length) };
     this.balls.push(b); this.groups[b.c].push(b);
     return b;
   }
@@ -296,32 +301,45 @@ class Sim {
     return best;
   }
 
-  // Rotate the bounce direction by the split angle. If the result still points into the (moving) wall,
-  // mirror it away from the wall. Then restore the set speed when the shape spins.
-  turn(rx, ry, sgn, nx, ny, un) {
-    const s = sgn * this.sn;
-    let x = rx * this.cs - ry * s, y = rx * s + ry * this.cs;
+  // The direction a ball takes after a bounce. un = speed of the wall along its outward normal (0 if fixed).
+  // 1. Scale to the set speed. 2. If it points into the wall (relative to the wall), mirror it.
+  // 3. Make sure it leaves the wall by at least the wall angle. 4. Keep the set speed.
+  leave(x, y, nx, ny, un) {
+    const v = this.speed, m = Math.hypot(x, y) || 1;
+    x *= v / m; y *= v / m;
     const d = x * nx + y * ny - un;
     if (d > 0) { x -= 2 * d * nx; y -= 2 * d * ny; }
-    if (this.spin) { const k = this.speed / Math.hypot(x, y); x *= k; y *= k; }
-    return [x, y];
+    let c = x * nx + y * ny;                                        // part along the outward normal
+    let tx = x - c * nx, ty = y - c * ny, tl = Math.hypot(tx, ty);  // part along the wall
+    if (tl < 1e-9) { tx = -ny; ty = nx; tl = 1; }
+    c = Math.max(-0.999 * v, Math.min(c, Math.min(un, 0) - this.smin * v));
+    const k = Math.sqrt(v * v - c * c) / tl;
+    return [c * nx + tx * k, c * ny + ty * k];
+  }
+
+  turn(rx, ry, sgn, nx, ny, un) {   // rotate the bounce direction by the split angle, then fix it
+    const s = sgn * this.sn;
+    return this.leave(rx * this.cs - ry * s, rx * s + ry * this.cs, nx, ny, un);
   }
 
   move(b, t, T) {   // T = time at the start of this movement
     for (let g = 0; g < 64 && t > 1e-12; g++) {
       const h = this.spin ? this.wallSpin(b, T, t) : this.wall(b);
-      if (h > t) { b.x += b.vx * t; b.y += b.vy * t; return; }
+      if (h > t) { b.x += b.vx * t; b.y += b.vy * t; b.cool = Math.max(0, b.cool - t); return; }
       b.x += b.vx * h; b.y += b.vy * h; t -= h; T += h; this.bounces++;
+      b.cool = Math.max(0, b.cool - h);
       const nx = this.nx, ny = this.ny, un = this.spin ? this.un : 0;
       const d = b.vx * nx + b.vy * ny - un;                    // approach speed relative to the wall
-      let rx = b.vx - 2 * d * nx, ry = b.vy - 2 * d * ny;      // bounce direction (mirror in the wall's frame)
-      if (this.spin) { const k = this.speed / Math.hypot(rx, ry); rx *= k; ry *= k; }
-      if (this.balls.length < this.M) {
+      const rx = b.vx - 2 * d * nx, ry = b.vy - 2 * d * ny;    // bounce direction (mirror in the wall's frame)
+      if (this.balls.length < this.M && b.cool <= 0) {
         const c = this.turn(rx, ry, -1, nx, ny, un), p = this.turn(rx, ry, 1, nx, ny, un);
         const kid = this.add(b.x, b.y, c[0], c[1]);
-        kid.rem = t; kid.T = T;                                // the child moves on for the rest of this frame
-        b.vx = p[0]; b.vy = p[1];
-      } else { b.vx = rx; b.vy = ry; }
+        kid.rem = t; kid.T = T; kid.cool = this.gap;           // the child moves on for the rest of this frame
+        b.vx = p[0]; b.vy = p[1]; b.cool = this.gap;
+      } else {                                                 // no split: too soon after the last one, or M reached
+        const o = this.leave(rx, ry, nx, ny, un);
+        b.vx = o[0]; b.vy = o[1];
+      }
     }
   }
 
