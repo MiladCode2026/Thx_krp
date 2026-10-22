@@ -86,11 +86,11 @@
 const GROUPS = {
   shape: ["Shape", [
     ["N_EDGES", "Edges (n)", 0, "0 = circle, 3 = triangle, 4 = square, 5 = pentagon, …"],
-    ["DIAMETER", "Shape diameter", 0.8, "Fraction of the frame width (or of the height, if that is smaller). A polygon fits inside a circle of this diameter"],
+    ["DIAMETER", "Overall width", 0.8, "Width of shape and plot together, as a fraction of the frame width (or of the height, if that is smaller). With the plot on, the shape gets 1/1.6 of it and the plot half the shape's width. A polygon fits inside a circle of the shape's diameter"],
     ["ROTATION", "Rotation (°)", 0, "Turns a polygon counter-clockwise at the start. 0 = flat bottom"],
     ["SPIN", "Spin (°/s)", 0, "Spins a polygon. Positive = counter-clockwise, negative = clockwise, 0 = fixed shape. A moving wall changes the bounce direction as a real moving wall would, but every ball keeps its speed. No effect on a circle"],
     ["OUTLINE", "Outline width", 3, "Pixels for a 1080-pixel video; 0 hides the outline"],
-    ["OUTLINE_COLOR", "Outline color", "#ffffff", "Any color"],
+    ["OUTLINE_COLOR", "Outline color", "#ffffff", "Any color. Also used for the plot axes"],
   ]],
   balls: ["Balls", [
     ["START_ANGLE", "Start angle (°)", 37, "Direction of the first ball. 0 = right, 90 = up, counter-clockwise"],
@@ -117,6 +117,11 @@ const GROUPS = {
   label: ["Label", [
     ["LABEL", "Label size", 40, "Size of the 'balls = …' text in pixels for a 1080-pixel video; 0 hides it"],
     ["LABEL_POS", "Label height", 0.97, "Height of the label's top edge from the bottom; 0.9 = 90%"],
+  ]],
+  plot: ["Plot", [
+    ["PLOT", "Plot", 1, "1 = show the ball count over time to the right of the shape; 0 = hide"],
+    ["PLOT_COLOR", "Plot color", "#7fdbff", "Any color"],
+    ["PLOT_HEADROOM", "Plot headroom", 1.25, "Top of the y-axis = this × the current ball count, so the axis starts low and grows with the balls. 1 = the curve touches the top"],
   ]],
   sound: ["Sound", [
     ["CLICK", "Click volume", 0.5, "A tick for each new ball. Pitch rises and volume falls as balls multiply. Saved in the video. 0 = silent; up to 1"],
@@ -166,8 +171,9 @@ function readSettings() {
   }
   if (!validColor(S.BG) || isMap(S.BG)) throw new Error(`Background: '${S.BG}' is not a color.`);
   if (!CSS.supports("color", S.OUTLINE_COLOR)) throw new Error(`Outline color: '${S.OUTLINE_COLOR}' is not a color.`);
+  if (!CSS.supports("color", S.PLOT_COLOR)) throw new Error(`Plot color: '${S.PLOT_COLOR}' is not a color.`);
   if (S.N_EDGES === 1 || S.N_EDGES === 2) throw new Error("Edges: use 0 for a circle, or 3 or more.");
-  if (S.DIAMETER <= 0) throw new Error("Shape diameter must be above 0.");
+  if (S.DIAMETER <= 0) throw new Error("Overall width must be above 0.");
   if (S.SPEED <= 0) throw new Error("Speed must be above 0.");
   if (S.BALL_SIZE <= 0 || S.BALL_SIZE >= 0.5) throw new Error("Ball diameter must be above 0 and below 0.5.");
   if (S.SPLIT_ANGLE >= 90) throw new Error("Split angle must be below 90.");
@@ -178,6 +184,7 @@ function readSettings() {
   if (S.FPS < 1) throw new Error("Frames per second must be at least 1.");
   if (S.CLICK > 1) throw new Error("Click volume must be 1 or less.");
   if (S.COLOR_CURVE <= 0) throw new Error("Color curve must be above 0.");
+  if (S.PLOT_HEADROOM < 1) throw new Error("Plot headroom must be 1 or more.");
   return S;
 }
 
@@ -213,6 +220,7 @@ class Sim {
     } else { this.pal = list; this.mapped = false; }
     this.maxFrames = Math.round(S.MAX_SEC * S.FPS);
     this.holdFrames = Math.round(S.HOLD_SEC * S.FPS);
+    this.total = 0;                                               // video length in frames; set after measure()
     this.reset();
   }
 
@@ -221,6 +229,7 @@ class Sim {
     this.frame = 0; this.bounces = 0; this.balls = [];
     this.groups = Array.from({ length: this.pal.length }, () => []);
     this.add(0, 0, v * Math.cos(a), v * Math.sin(a));
+    this.history = [this.balls.length];                           // ball count of each frame so far
     this.reached = this.balls.length >= this.M ? 0 : -1;
   }
 
@@ -365,6 +374,7 @@ class Sim {
       if (this.spin) this.clamp(b);
     }
     this.frame++;
+    this.history.push(B.length);
     if (this.reached < 0 && B.length >= this.M) this.reached = this.frame;
   }
 
@@ -375,14 +385,16 @@ class Sim {
   seek(f) { if (f < this.frame) this.reset(); while (this.frame < f) this.advance(); }
 
   draw(ctx, W, H) {
-    const S = this.S, px = Math.min(W, H) / 1080, D = S.DIAMETER * Math.min(W, H);
-    const X = x => W / 2 + x * D, Y = y => H / 2 - y * D;
+    const S = this.S, px = Math.min(W, H) / 1080, span = S.DIAMETER * Math.min(W, H);
+    const D = S.PLOT > 0 ? span / 1.6 : span;                  // shape 1, gap 0.1, plot 0.5
+    const left = W / 2 - span / 2, cx = left + D / 2;
+    const X = x => cx + x * D, Y = y => H / 2 - y * D;
     const rot = this.spin * this.frame * this.dt;              // how far the polygon has turned
     ctx.globalAlpha = 1; ctx.fillStyle = S.BG; ctx.fillRect(0, 0, W, H);
     if (S.OUTLINE > 0) {
       ctx.strokeStyle = S.OUTLINE_COLOR; ctx.lineWidth = S.OUTLINE * px; ctx.lineJoin = "round";
       ctx.beginPath();
-      if (this.n < 3) ctx.arc(W / 2, H / 2, this.R * D, 0, 2 * Math.PI);
+      if (this.n < 3) ctx.arc(cx, H / 2, this.R * D, 0, 2 * Math.PI);
       else this.normals.forEach(([, , a], k) => {
         const v = a + rot + Math.PI / this.n, x = X(this.R * Math.cos(v)), y = Y(this.R * Math.sin(v));
         if (k) ctx.lineTo(x, y); else ctx.moveTo(x, y);
@@ -396,6 +408,7 @@ class Sim {
       for (const b of g) { const x = X(b.x), y = Y(b.y); ctx.moveTo(x + rr, y); ctx.arc(x, y, rr, 0, 2 * Math.PI); }
       ctx.fill();
     });
+    if (S.PLOT > 0) this.drawPlot(ctx, left + 1.1 * D, H / 2 - D / 2, D / 2, D, px);
     if (S.LABEL > 0) {
       ctx.globalAlpha = 0.85; ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.textBaseline = "top";
       ctx.font = `${S.LABEL * px}px monospace`;
@@ -403,12 +416,40 @@ class Sim {
       ctx.globalAlpha = 1;
     }
   }
+
+  drawPlot(ctx, x0, y0, w, h, px) {   // ball count over time; the y-axis grows with the count
+    const S = this.S, hist = this.history, n = hist.length;
+    const total = Math.max(2, this.total || this.maxFrames + 1);
+    const ylim = Math.max(10, S.PLOT_HEADROOM * hist[n - 1]);
+    const PX = f => x0 + w * f / (total - 1), PY = c => y0 + h * (1 - c / ylim);
+    const raw = ylim / 4, p = 10 ** Math.floor(Math.log10(raw)), m = raw / p;
+    const step = p * (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10);   // grid of 1, 2 or 5 × a power of ten
+    ctx.font = `${22 * px}px monospace`; ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+    ctx.strokeStyle = ctx.fillStyle = S.OUTLINE_COLOR; ctx.lineWidth = px;
+    for (let v = step; v <= ylim; v += step) {
+      const y = PY(v);
+      ctx.globalAlpha = 0.25; ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x0 + w, y); ctx.stroke();
+      ctx.globalAlpha = 0.6; ctx.fillText(String(v), x0 + 4 * px, y - 2 * px);
+    }
+    ctx.globalAlpha = 0.8; ctx.lineWidth = 2 * px;
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0, y0 + h); ctx.lineTo(x0 + w, y0 + h); ctx.stroke();
+    ctx.globalAlpha = 0.6; ctx.textBaseline = "top";
+    ctx.fillText("0", x0, y0 + h + 4 * px);
+    ctx.textAlign = "right"; ctx.fillText(`${Math.round((total - 1) / S.FPS)} s`, x0 + w, y0 + h + 4 * px);
+    ctx.globalAlpha = 1; ctx.beginPath(); ctx.moveTo(PX(0), PY(hist[0]));
+    for (let f = 1; f < n; f++) ctx.lineTo(PX(f), PY(hist[f]));
+    ctx.strokeStyle = S.PLOT_COLOR; ctx.lineWidth = 3 * px; ctx.lineJoin = "round"; ctx.stroke();
+    ctx.lineTo(PX(n - 1), y0 + h); ctx.lineTo(PX(0), y0 + h); ctx.closePath();
+    ctx.globalAlpha = 0.2; ctx.fillStyle = S.PLOT_COLOR; ctx.fill();
+    ctx.globalAlpha = 1;
+  }
 }
 
 function measure(S) {   // run once to learn the video length and the ball count of each frame
   const p = new Sim(S), counts = [];
   while (!p.done()) { counts.push(p.balls.length); p.advance(); }
   counts.push(p.balls.length);
+  p.total = p.frame + 1;
   return { total: p.frame + 1, reached: p.reached, balls: p.balls.length, sim: p, counts };
 }
 
@@ -583,6 +624,7 @@ async function runExport(S) {
     if (!("VideoEncoder" in window)) throw new Error("This browser cannot make videos. Please use an up-to-date Chrome over https.");
     await sleep(30);
     const m = measure(S), total = m.total, sim = new Sim(S);
+    sim.total = total;
     let mod;
     try { mod = await import(MUXER_URL); } catch { throw new Error("Could not load the video tool. Check your internet connection."); }
     const { Muxer, ArrayBufferTarget } = mod;
